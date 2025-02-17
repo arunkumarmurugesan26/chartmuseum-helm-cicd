@@ -1,0 +1,207 @@
+name: Helm CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: write
+  
+jobs:
+  helm-validation-static-analysis:
+    name: Helm Formatting & Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Helm Lint
+        run: helm lint helloworld/
+
+  image-scan:
+    name: Docker Image CVE Scan from Deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+          export PATH=$PATH:$HOME/.local/bin
+          ./bin/trivy --version
+
+      - name: Get the Image Name from Helm Chart Deployment
+        id: extract_image
+        run: |
+          IMAGE=$(helm template my-release ./helloworld/ | grep 'image:' | head -n 1 | awk '{print $2}' | tr -d '"')  # Remove quotes
+          IMAGE="docker.io/$IMAGE"  # Add docker.io prefix if missing
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Scan the Image with Trivy
+        run: |
+          echo "Scanning image: $IMAGE"
+          ./bin/trivy image --format table --output trivy-report.txt $IMAGE
+
+      - name: Upload Trivy Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.txt
+
+  helm-deployment:
+    name: Helm Package & Deploy to Kind
+    runs-on: ubuntu-latest
+    needs: [helm-validation-static-analysis, image-scan]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Increment Helm Chart Version
+        run: |
+          VERSION="1.0.${{ github.run_number }}"
+          echo "Setting version to $VERSION"
+          sed -i "s/^version: .*/version: $VERSION/" helloworld/Chart.yaml
+          cat helloworld/Chart.yaml
+
+      - name: Package Helm Chart
+        run: |
+          helm package helloworld/
+          mkdir helm-packages
+          mv helloworld-*.tgz helm-packages/
+
+      - name: Setup KinD Cluster
+        uses: helm/kind-action@v1
+
+      - name: Deploy Helm Chart to KinD
+        run: |
+          helm install my-release helm-packages/helloworld-*.tgz --wait --timeout 60s
+
+      - name: Capture Kubernetes Events
+        run: kubectl get events --sort-by=.metadata.creationTimestamp > k8s-events.log || true
+
+      - name: Capture Helm Deployment Details
+        run: |
+          helm list -A > helm-list.log
+          kubectl get pods -A > k8s-pods.log
+          kubectl get deployments -A > k8s-deployments.log
+          kubectl describe pods -A > k8s-describe-pods.log
+          kubectl logs -l app=my-release > k8s-pod-logs.log || true
+
+      - name: Upload Deployment Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-logs
+          path: |
+            k8s-events.log
+            helm-list.log
+            k8s-pods.log
+            k8s-deployments.log
+            k8s-describe-pods.log
+            k8s-pod-logs.log
+
+  push-to-s3:
+    name: Push Helm Package to S3
+    runs-on: ubuntu-latest
+    needs: [helm-deployment]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install Helm S3 Plugin
+        run: helm plugin install https://github.com/hypnoglow/helm-s3.git
+
+      # - name: Configure AWS Credentials
+      #   run: |
+      #     echo "[default]" > ~/.aws/credentials
+      #     echo "aws_access_key_id=$AWS_ACCESS_KEY_ID" >> ~/.aws/credentials
+      #     echo "aws_secret_access_key=$AWS_SECRET_ACCESS_KEY" >> ~/.aws/credentials
+      #   env:
+      #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Add S3 Helm Repo
+        run: helm repo add my-s3-repo s3://chartmuseum-repo-bucket-devops/
+
+      - name: Increment Helm Chart Version
+        run: |
+          VERSION="1.0.${{ github.run_number }}"
+          echo "Setting version to $VERSION"
+          sed -i "s/^version: .*/version: $VERSION/" helloworld/Chart.yaml
+          cat helloworld/Chart.yaml
+
+      - name: Package Helm Chart
+        run: |
+          helm package helloworld/
+          mkdir helm-packages
+          mv helloworld-*.tgz helm-packages/
+
+      - name: Push Helm Package to S3
+        run: |
+          helm s3 push --force helm-packages/helloworld-*.tgz my-s3-repo
+
+      - name: Reindex Helm Repo
+        run: helm s3 reindex my-s3-repo
+
+      - name: Commit and Push Updated Chart Version
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add helloworld/Chart.yaml
+          git commit -m "Auto-bump Helm chart version to $VERSION"
+          git push origin main
+
+  push-to-chartmuseum:
+    name: Push Helm Package to ChartMuseum API
+    runs-on: ubuntu-latest
+    needs: [helm-deployment]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Get Helm Chart Version
+        run: |
+          CHART_VERSION=$(grep '^version:' helloworld/Chart.yaml | awk '{print $2}')
+          echo "CHART_VERSION=$CHART_VERSION" >> $GITHUB_ENV
+
+      - name: Increment Helm Chart Version
+        run: |
+          VERSION="1.0.${{ github.run_number }}"
+          echo "Setting version to $VERSION"
+          sed -i "s/^version: .*/version: $VERSION/" helloworld/Chart.yaml
+          cat helloworld/Chart.yaml
+          echo "CHART_VERSION=$VERSION" >> $GITHUB_ENV
+  
+      - name: Package Helm Chart
+        run: |
+          helm package helloworld/
+          mkdir helm-packages
+          mv helloworld-*.tgz helm-packages/
+
+## Commented out this step as we need a actual domain to push it.    
+      # - name: Upload Helm Chart to ChartMuseum via API
+      #   run: |
+      #     curl --data-binary "@helm-packages/helloworld-${{ env.CHART_VERSION }}.tgz" \
+      #       -X POST http://chartmuseum.example.com/api/charts
